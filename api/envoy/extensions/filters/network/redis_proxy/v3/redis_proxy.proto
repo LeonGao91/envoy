@@ -25,7 +25,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // Redis Proxy :ref:`configuration overview <config_network_filters_redis_proxy>`.
 // [#extension: envoy.filters.network.redis_proxy]
 
-// [#next-free-field: 10]
+// [#next-free-field: 11]
 message RedisProxy {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.config.filter.network.redis_proxy.v2.RedisProxy";
@@ -129,6 +129,54 @@ message RedisProxy {
     ReadPolicy read_policy = 7 [(validate.rules).enum = {defined_only: true}];
   }
 
+  // The router is capable of shadowing traffic from one cluster to another. The current
+  // implementation is "fire and forget," meaning Envoy will not wait for the shadow cluster to
+  // respond before returning the response from the primary cluster. All normal statistics are
+  // collected for the shadow cluster making this feature useful for testing.
+  message RequestMirrorPolicy {
+    // Specifies the cluster that requests will be mirrored to. The cluster must
+    // exist in the cluster manager configuration.
+    string cluster = 1 [(validate.rules).string = {min_len: 1}];
+
+    // If not specified or the runtime key is not present, all requests to the target cluster
+    // will be mirrored.
+    //
+    // If specified, Envoy will lookup the runtime key to get the percentage of requests to the
+    // mirror.
+    config.core.v3.RuntimeFractionalPercent runtime_fraction = 2;
+
+    // Set this to TRUE to only mirror write commands, this is effectively replicating the
+    // writes in a "fire and forget" manner.
+    bool exclude_read_commands = 3;
+  }
+
+  // List of **unique** prefixes used to separate keys from different workloads to different
+  // clusters. Envoy will always favor the longest match first in case of overlap. A catch-all
+  // cluster can be used to forward commands when there is no match. Time complexity of the
+  // lookups are in O(min(longest key prefix, key length)).
+  //
+  // Example:
+  //
+  // .. code-block:: yaml
+  //
+  //    prefix_routes:
+  //      routes:
+  //        - prefix: "ab"
+  //          cluster: "cluster_a"
+  //        - prefix: "abc"
+  //          cluster: "cluster_b"
+  //
+  // When using the above routes, the following prefixes would be sent to:
+  //
+  // * ``get abc:users`` would retrieve the key 'abc:users' from cluster_b.
+  // * ``get ab:users`` would retrieve the key 'ab:users' from cluster_a.
+  // * ``get z:users`` would return a NoUpstreamHost error. A :ref:`catch-all
+  //   route<envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.PrefixRoutes.catch_all_route>`
+  //   would have retrieved the key from that cluster instead.
+  //
+  // See the :ref:`configuration section
+  // <arch_overview_redis_configuration>` of the architecture overview for recommendations on
+  // configuring the backing clusters.
   message PrefixRoutes {
     option (udpa.annotations.versioning).previous_message_type =
         "envoy.config.filter.network.redis_proxy.v2.RedisProxy.PrefixRoutes";
@@ -136,31 +184,6 @@ message RedisProxy {
     message Route {
       option (udpa.annotations.versioning).previous_message_type =
           "envoy.config.filter.network.redis_proxy.v2.RedisProxy.PrefixRoutes.Route";
-
-      // The router is capable of shadowing traffic from one cluster to another. The current
-      // implementation is "fire and forget," meaning Envoy will not wait for the shadow cluster to
-      // respond before returning the response from the primary cluster. All normal statistics are
-      // collected for the shadow cluster making this feature useful for testing.
-      message RequestMirrorPolicy {
-        option (udpa.annotations.versioning).previous_message_type =
-            "envoy.config.filter.network.redis_proxy.v2.RedisProxy.PrefixRoutes.Route."
-            "RequestMirrorPolicy";
-
-        // Specifies the cluster that requests will be mirrored to. The cluster must
-        // exist in the cluster manager configuration.
-        string cluster = 1 [(validate.rules).string = {min_len: 1}];
-
-        // If not specified or the runtime key is not present, all requests to the target cluster
-        // will be mirrored.
-        //
-        // If specified, Envoy will lookup the runtime key to get the percentage of requests to the
-        // mirror.
-        config.core.v3.RuntimeFractionalPercent runtime_fraction = 2;
-
-        // Set this to TRUE to only mirror write commands, this is effectively replicating the
-        // writes in a "fire and forget" manner.
-        bool exclude_read_commands = 3;
-      }
 
       // String prefix that must match the beginning of the keys. Envoy will always favor the
       // longest match.
@@ -189,6 +212,103 @@ message RedisProxy {
     // Optional catch-all route to forward commands that doesn't match any of the routes. The
     // catch-all route becomes required when no routes are specified.
     Route catch_all_route = 4;
+  }
+
+  // When hash_slot_routes is configured, redis proxy will forward requests to upstream cluster
+  // based on the hash result of the key. You can configure 8192 hash slots [0, 8191] in total.
+  // Redis proxy will compute the value of "hash(key) % 8192" to decide which redis cluster to
+  // forward the requests to.
+  //
+  // Example:
+  //
+  // .. code-block:: yaml
+  //
+  //    hash_slot_routes:
+  //      routes:
+  //        - slot_ranges:
+  //          - start: 0
+  //            end: 4095
+  //          cluster: "cluster_a"
+  //        - slot_ranges:
+  //          - start: 4096
+  //            end: 8191
+  //          cluster: "cluster_b"
+  //
+  // With the above configuration, when the hash result of the key is between 0-4095, the requests
+  // will be forward to cluster_a. When the hash result of the key is between 4096-8191, the requests
+  // will be forward to cluster_b.
+  //
+  // You can configure multiple slot ranges for one upstream cluster:
+  //
+  // Example:
+  //
+  // .. code-block:: yaml
+  //
+  //    hash_slot_routes:
+  //      routes:
+  //        - slot_ranges:
+  //          - start: 0
+  //            end: 4095
+  //          - start: 7000
+  //            end: 8191
+  //          cluster: "cluster_a"
+  //        - slot_ranges:
+  //          - start: 4096
+  //            end: 6999
+  //          cluster: "cluster_b"
+  //
+  // When there are un-assigned slots, A :ref:`catch-all
+  //   route<envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.HashSlotRoutes.catch_all_route>`
+  //   would be used instead.
+  //
+  // Example:
+  //
+  // .. code-block:: yaml
+  //
+  //    hash_slot_routes:
+  //      routes:
+  //        - slot_ranges:
+  //          - start: 0
+  //            end: 0
+  //          cluster: "cluster_a"
+  //      catch_all_route:
+  //        cluster: "cluster_b"
+  //
+  // With above, all the keys falls in 1-8191 will be routed to "cluster_b".
+  // When we want to route all keys to one cluster, we can just configure it as catch_all_route.
+  //
+  // When there are overlaps of slot ranges configured redis proxy will throw exception.
+  message HashSlotRoutes {
+    message Route {
+      // Starting slot number and end slot number for this route.
+      // Keys with the hash value that fall into the slot range will be routed to this cluster.
+      // There are 8192 slots in total so the value should be between 0 to 8191.
+      message SlotRange {
+        uint32 start = 1 [(validate.rules).uint32 = {lte: 8191 gte: 0}];
+
+        uint32 end = 2 [(validate.rules).uint32 = {lte: 8191 gte: 0}];
+      }
+
+      repeated SlotRange slot_ranges = 1;
+
+      // Upstream cluster to forward the command to.
+      string cluster = 2 [(validate.rules).string = {min_len: 1}];
+
+      // Indicates that the route has a request mirroring policy.
+      repeated RequestMirrorPolicy request_mirror_policy = 3;
+    }
+
+    reserved 2;
+
+    reserved "catch_all_cluster";
+
+    // List of hash slot routes.
+    repeated Route routes = 1;
+
+    // Optional catch-all route to forward commands that doesn't match any of the routes. The
+    // catch-all route becomes required when no routes are specified or there are slots not covered
+    // with the slot range.
+    Route catch_all_route = 3;
   }
 
   // RedisFault defines faults used for fault injection.
@@ -230,34 +350,13 @@ message RedisProxy {
   // milliseconds. This does not apply to upstream command stats currently.
   bool latency_in_micros = 4;
 
-  // List of **unique** prefixes used to separate keys from different workloads to different
-  // clusters. Envoy will always favor the longest match first in case of overlap. A catch-all
-  // cluster can be used to forward commands when there is no match. Time complexity of the
-  // lookups are in O(min(longest key prefix, key length)).
-  //
-  // Example:
-  //
-  // .. code-block:: yaml
-  //
-  //    prefix_routes:
-  //      routes:
-  //        - prefix: "ab"
-  //          cluster: "cluster_a"
-  //        - prefix: "abc"
-  //          cluster: "cluster_b"
-  //
-  // When using the above routes, the following prefixes would be sent to:
-  //
-  // * ``get abc:users`` would retrieve the key 'abc:users' from cluster_b.
-  // * ``get ab:users`` would retrieve the key 'ab:users' from cluster_a.
-  // * ``get z:users`` would return a NoUpstreamHost error. A :ref:`catch-all
-  //   route<envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.PrefixRoutes.catch_all_route>`
-  //   would have retrieved the key from that cluster instead.
-  //
-  // See the :ref:`configuration section
-  // <arch_overview_redis_configuration>` of the architecture overview for recommendations on
-  // configuring the backing clusters.
-  PrefixRoutes prefix_routes = 5;
+  // Router implementation.
+  // Currently we support routes based on key prefix or key hash result.
+  oneof routes {
+    PrefixRoutes prefix_routes = 5;
+
+    HashSlotRoutes hash_slot_routes = 10;
+  }
 
   // Authenticate Redis client connections locally by forcing downstream clients to issue a `Redis
   // AUTH command <https://redis.io/commands/auth>`_ with this password before enabling any other
